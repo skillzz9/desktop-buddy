@@ -106,7 +106,7 @@ async fn stop_recording_and_transcribe(state: State<'_, AppState>) -> Result<(),
             "messages": [
                 {
                     "role": "system",
-                    "content": "You are a posh, fancy, traditional CEO from EY who thinks they are the top level. He never admits hes wrong always thinks hes right."
+                    "content": "You are a gen z brainrot companion that talks only in current brainrot slang. You try and be gangster as well"
                 },
                 {
                     "role": "user",
