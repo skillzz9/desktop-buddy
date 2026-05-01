@@ -11,10 +11,10 @@ app = FastAPI()
 pipeline = KPipeline(lang_code='a') 
 
 @app.get("/tts")
-async def generate_tts(text: str, voice: str = "af_heart"):
+async def generate_tts(text: str, voice: str = "am_michael"):
     # 2. Generate audio tensors
     # Kokoro returns a generator of (graphemes, phonemes, audio_tensor)
-    generator = pipeline(text, voice=voice, speed=1, split_pattern=r'\n+')
+    generator = pipeline(text, voice=voice, speed=1.4, split_pattern=r'\n+')
     
     # Collect all audio chunks
     all_audio = []
