@@ -6,6 +6,8 @@ use tauri::{Manager, State};
 use dotenvy::dotenv;
 use std::env;
 use std::io::Cursor; // Added for rodio playback
+use futures_util::StreamExt; // Added for reading the Groq stream
+use std::io::Write; // Added to flush print statements
 
 // state to share data between background audio thread and React
 struct AppState {
@@ -101,7 +103,48 @@ async fn stop_recording_and_transcribe(state: State<'_, AppState>) -> Result<(),
 
         println!("🧠 Avatar is thinking...");
 
-        // === LLM STEP ===
+        // === STEP 3: STREAMING LLM & TTS PIPELINE ===
+        
+        // 1. Channel from LLM to the async TTS Fetcher
+        let (tx_text, mut rx_text) = tokio::sync::mpsc::channel::<String>(32);
+        
+        // 2. Channel from the async TTS Fetcher to the Sync Audio Player
+        let (tx_audio, rx_audio) = std::sync::mpsc::channel::<Vec<u8>>();
+        let tts_client = client.clone();
+
+        // 3. Spawn the synchronous Audio Player on a dedicated thread
+        // std::thread::spawn is safe for rodio because it doesn't move across threads.
+        std::thread::spawn(move || {
+            let (_stream, stream_handle) = rodio::OutputStream::try_default().unwrap();
+            let sink = rodio::Sink::try_new(&stream_handle).unwrap();
+
+            // Wait for downloaded audio bytes and queue them seamlessly
+            while let Ok(audio_bytes) = rx_audio.recv() {
+                if let Ok(source) = rodio::Decoder::new(Cursor::new(audio_bytes)) {
+                    sink.append(source);
+                }
+            }
+            // Once the channel closes, wait for the final queued audio to finish playing
+            sink.sleep_until_end(); 
+        });
+
+        // 4. Spawn the asynchronous TTS Fetcher
+        tokio::spawn(async move {
+            while let Some(sentence) = rx_text.recv().await {
+                let encoded_text = urlencoding::encode(&sentence);
+                // Hardcoded the speed factor to give it that brainrot pacing
+                let tts_url = format!("http://127.0.0.1:8000/tts?text={}&speed=1.2", encoded_text);
+                
+                if let Ok(tts_res) = tts_client.get(&tts_url).send().await {
+                    if let Ok(audio_bytes) = tts_res.bytes().await {
+                        // Send the raw bytes to the audio thread
+                        let _ = tx_audio.send(audio_bytes.to_vec());
+                    }
+                }
+            }
+        });
+
+        // Setup the payload to enable streaming
         let llm_payload = serde_json::json!({
             "model": "llama-3.1-8b-instant", 
             "messages": [
@@ -113,57 +156,65 @@ async fn stop_recording_and_transcribe(state: State<'_, AppState>) -> Result<(),
                     "role": "user",
                     "content": user_text
                 }
-            ]
+            ],
+            "stream": true // CRITICAL: Tell Groq to stream the response
         });
 
-        let llm_res = client.post("https://api.groq.com/openai/v1/chat/completions")
+        let mut stream = client.post("https://api.groq.com/openai/v1/chat/completions")
             .bearer_auth(&api_key)
             .json(&llm_payload)
             .send()
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| e.to_string())?
+            .bytes_stream();
 
-        let llm_json: serde_json::Value = llm_res.json().await.map_err(|e| e.to_string())?;
+        print!("🤖 AVATAR SAYS: ");
+        let _ = std::io::stdout().flush();
+        
+        let mut sentence_buffer = String::new();
 
-        // Extract the LLM's response, print it, and then trigger TTS/Playback
-        if let Some(choices) = llm_json.get("choices") {
-            if let Some(first_choice) = choices.get(0) {
-                if let Some(message) = first_choice.get("message") {
-                    if let Some(content) = message.get("content") {
-                        let avatar_reply = content.as_str().unwrap_or("");
-                        println!("🤖 AVATAR SAYS: {}\n", avatar_reply);
+        // Iterate through the incoming text tokens
+        while let Some(chunk) = stream.next().await {
+            let bytes = chunk.map_err(|e| e.to_string())?;
+            let data = String::from_utf8_lossy(&bytes);
 
-                        // --- STEP 3: LOCAL TTS (KOKORO) ---
-                        // Moved inside this block so avatar_reply is in scope
-                        let tts_url = format!("http://127.0.0.1:8000/tts?text={}", urlencoding::encode(avatar_reply));
-                        let tts_res = client.get(tts_url)
-                            .send()
-                            .await
-                            .map_err(|e| e.to_string())?;
+            for line in data.lines() {
+                if line.starts_with("data: [DONE]") { break; }
+                if line.starts_with("data: ") {
+                    let json_str = &line[6..];
+                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(json_str) {
+                        if let Some(content) = val["choices"][0]["delta"]["content"].as_str() {
+                            sentence_buffer.push_str(content);
+                            
+                            // Print to the terminal in real-time
+                            print!("{}", content);
+                            let _ = std::io::stdout().flush();
 
-                        let audio_bytes = tts_res.bytes().await.map_err(|e| e.to_string())?;
-
-                        // --- STEP 4: PLAYBACK ---
-                        let (_stream, stream_handle) = rodio::OutputStream::try_default().map_err(|e| e.to_string())?;
-                        let sink = rodio::Sink::try_new(&stream_handle).map_err(|e| e.to_string())?;
-                        let cursor = Cursor::new(audio_bytes);
-                        let source = rodio::Decoder::new(cursor).map_err(|e| e.to_string())?;
-
-                        sink.append(source);
-                        sink.sleep_until_end(); // This blocks the thread until the avatar finishes talking
-
-                        return Ok(());
+                            // Check for sentence delimiters to trigger the TTS
+                            if content.contains('.') || content.contains('!') || content.contains('?') {
+                                let to_speak = sentence_buffer.clone();
+                                sentence_buffer.clear();
+                                
+                                // Send the finished sentence to the background TTS fetcher
+                                let _ = tx_text.send(to_speak).await;
+                            }
+                        }
                     }
                 }
             }
         }
-        println!("❌ LLM Error: {:?}", llm_json);
+
+        // Catch any remaining text that didn't end with a punctuation mark
+        if !sentence_buffer.trim().is_empty() {
+            let _ = tx_text.send(sentence_buffer).await;
+        }
+
+        println!("\n"); // Add a newline after the full stream finishes
 
     } else {
         println!("❌ API Error: {:?}", json);
     }
 
-    // run the function
     Ok(())
 }
 //-------------------------------------------------------------------------------------------//
