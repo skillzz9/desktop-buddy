@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 use tauri::{Manager, State};
 use dotenvy::dotenv;
 use std::env;
+use std::io::Cursor; // Added for rodio playback
 
 // state to share data between background audio thread and React
 struct AppState {
@@ -124,13 +125,33 @@ async fn stop_recording_and_transcribe(state: State<'_, AppState>) -> Result<(),
 
         let llm_json: serde_json::Value = llm_res.json().await.map_err(|e| e.to_string())?;
 
-        // Extract the LLM's response and print it
+        // Extract the LLM's response, print it, and then trigger TTS/Playback
         if let Some(choices) = llm_json.get("choices") {
             if let Some(first_choice) = choices.get(0) {
                 if let Some(message) = first_choice.get("message") {
                     if let Some(content) = message.get("content") {
                         let avatar_reply = content.as_str().unwrap_or("");
                         println!("🤖 AVATAR SAYS: {}\n", avatar_reply);
+
+                        // --- STEP 3: LOCAL TTS (KOKORO) ---
+                        // Moved inside this block so avatar_reply is in scope
+                        let tts_url = format!("http://127.0.0.1:8000/tts?text={}", urlencoding::encode(avatar_reply));
+                        let tts_res = client.get(tts_url)
+                            .send()
+                            .await
+                            .map_err(|e| e.to_string())?;
+
+                        let audio_bytes = tts_res.bytes().await.map_err(|e| e.to_string())?;
+
+                        // --- STEP 4: PLAYBACK ---
+                        let (_stream, stream_handle) = rodio::OutputStream::try_default().map_err(|e| e.to_string())?;
+                        let sink = rodio::Sink::try_new(&stream_handle).map_err(|e| e.to_string())?;
+                        let cursor = Cursor::new(audio_bytes);
+                        let source = rodio::Decoder::new(cursor).map_err(|e| e.to_string())?;
+
+                        sink.append(source);
+                        sink.sleep_until_end(); // This blocks the thread until the avatar finishes talking
+
                         return Ok(());
                     }
                 }
