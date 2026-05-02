@@ -129,20 +129,34 @@ async fn stop_recording_and_transcribe(state: State<'_, AppState>) -> Result<(),
         });
 
         // 4. Spawn the asynchronous TTS Fetcher
+tokio::spawn(async move {
+    use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
+    use futures_util::{StreamExt, SinkExt};
+
+    let ws_url = "ws://127.0.0.1:8000/tts-stream";
+    
+    // Connect to the Python WebSocket
+    if let Ok((ws_stream, _)) = connect_async(ws_url).await {
+        let (mut ws_write, mut ws_read) = ws_stream.split();
+
+        // Task to read binary audio coming BACK from Python
+        let tx_audio_clone = tx_audio.clone();
         tokio::spawn(async move {
-            while let Some(sentence) = rx_text.recv().await {
-                let encoded_text = urlencoding::encode(&sentence);
-                // Hardcoded the speed factor to give it that brainrot pacing
-                let tts_url = format!("http://127.0.0.1:8000/tts?text={}&speed=1.2", encoded_text);
-                
-                if let Ok(tts_res) = tts_client.get(&tts_url).send().await {
-                    if let Ok(audio_bytes) = tts_res.bytes().await {
-                        // Send the raw bytes to the audio thread
-                        let _ = tx_audio.send(audio_bytes.to_vec());
-                    }
-                }
+            while let Some(Ok(Message::Binary(bin))) = ws_read.next().await {
+                let _ = tx_audio_clone.send(bin);
             }
         });
+
+        // Loop to send text sentences TO Python
+        while let Some(sentence) = rx_text.recv().await {
+            if !sentence.trim().is_empty() {
+                let _ = ws_write.send(Message::Text(sentence)).await;
+            }
+        }
+    } else {
+        eprintln!("❌ Could not connect to Python TTS WebSocket");
+    }
+});
 
         // Setup the payload to enable streaming
         let llm_payload = serde_json::json!({
