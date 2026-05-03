@@ -101,6 +101,16 @@ async fn stop_recording_and_transcribe(state: State<'_, AppState>) -> Result<(),
         println!("🗣️ YOU SAID: {}", user_text);
         println!("========================================\n");
 
+        // === SCREEN AWARENESS STEP ===
+        // Asking Python backend to take a fresh screenshot
+        println!("📸 Asking Python for a screenshot...");
+        let screenshot_res = client.get("http://127.0.0.1:8000/capture")
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        let screenshot_json: serde_json::Value = screenshot_res.json().await.map_err(|e| e.to_string())?;
+        let b64_image = screenshot_json["b64_image"].as_str().unwrap_or("");
+
         println!("🧠 Avatar is thinking...");
 
         // === STEP 3: STREAMING LLM & TTS PIPELINE ===
@@ -113,7 +123,6 @@ async fn stop_recording_and_transcribe(state: State<'_, AppState>) -> Result<(),
         let tts_client = client.clone();
 
         // 3. Spawn the synchronous Audio Player on a dedicated thread
-        // std::thread::spawn is safe for rodio because it doesn't move across threads.
         std::thread::spawn(move || {
             let (_stream, stream_handle) = rodio::OutputStream::try_default().unwrap();
             let sink = rodio::Sink::try_new(&stream_handle).unwrap();
@@ -129,46 +138,57 @@ async fn stop_recording_and_transcribe(state: State<'_, AppState>) -> Result<(),
         });
 
         // 4. Spawn the asynchronous TTS Fetcher
-tokio::spawn(async move {
-    use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
-    use futures_util::{StreamExt, SinkExt};
-
-    let ws_url = "ws://127.0.0.1:8000/tts-stream";
-    
-    // Connect to the Python WebSocket
-    if let Ok((ws_stream, _)) = connect_async(ws_url).await {
-        let (mut ws_write, mut ws_read) = ws_stream.split();
-
-        // Task to read binary audio coming BACK from Python
-        let tx_audio_clone = tx_audio.clone();
         tokio::spawn(async move {
-            while let Some(Ok(Message::Binary(bin))) = ws_read.next().await {
-                let _ = tx_audio_clone.send(bin);
+            use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
+            use futures_util::{StreamExt, SinkExt};
+
+            let ws_url = "ws://127.0.0.1:8000/tts-stream";
+            
+            // Connect to the Python WebSocket
+            if let Ok((ws_stream, _)) = connect_async(ws_url).await {
+                let (mut ws_write, mut ws_read) = ws_stream.split();
+
+                // Task to read binary audio coming BACK from Python
+                let tx_audio_clone = tx_audio.clone();
+                tokio::spawn(async move {
+                    while let Some(Ok(Message::Binary(bin))) = ws_read.next().await {
+                        let _ = tx_audio_clone.send(bin);
+                    }
+                });
+
+                // Loop to send text sentences TO Python
+                while let Some(sentence) = rx_text.recv().await {
+                    if !sentence.trim().is_empty() {
+                        let _ = ws_write.send(Message::Text(sentence)).await;
+                    }
+                }
+            } else {
+                eprintln!("❌ Could not connect to Python TTS WebSocket");
             }
         });
 
-        // Loop to send text sentences TO Python
-        while let Some(sentence) = rx_text.recv().await {
-            if !sentence.trim().is_empty() {
-                let _ = ws_write.send(Message::Text(sentence)).await;
-            }
-        }
-    } else {
-        eprintln!("❌ Could not connect to Python TTS WebSocket");
-    }
-});
-
-        // Setup the payload to enable streaming
+        // Setup the multimodal payload to enable streaming and screen awareness
         let llm_payload = serde_json::json!({
-            "model": "llama-3.1-8b-instant", 
+            "model": "meta-llama/llama-4-scout-17b-16e-instruct", 
             "messages": [
                 {
                     "role": "system",
-                    "content": "You are a gen z brainrot companion that talks only in current brainrot slang. You try and be gangster as well"
+                    "content": "You are a gen z brainrot companion that talks only in current brainrot slang. You try and be gangster as well. You have vision access to the user's primary screen, so roast or comment on what they are looking at if it fits the vibe."
                 },
                 {
                     "role": "user",
-                    "content": user_text
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": user_text
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": format!("data:image/png;base64,{}", b64_image)
+                            }
+                        }
+                    ]
                 }
             ],
             "stream": true // CRITICAL: Tell Groq to stream the response
